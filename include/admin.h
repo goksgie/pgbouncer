@@ -15,7 +15,30 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
+enum AdminExtendedQuertyState {
+    /*
+     * WHen clients use simple query to interact with the admin console,
+     * the default value will be extended query disabled. 
+     */
+    ADMIN_EXT_QUERY_DISABLED = 0,
+
+    /* 
+     * Extended protocol sends a Describe packet.
+     * Functions for the parsed command will only populate the 
+     * description row.
+     */
+    ADMIN_EXT_QUERY_DESCRIBE_NEEDED,
+
+    /*
+     * When client sends an execute packet, we do not need to generate 
+     * a description row again, since that was already handled with
+     * describe packet. 
+     */
+    ADMIN_EXT_QUERY_DESCRIBE_COMPLETED,
+};
+
 void admin_free(PgSocket *admin);
+bool admin_should_describe_rows(PgSocket *admin) _MUSTCHECK;
 bool admin_handle_client(PgSocket *client, PktHdr *pkt)  _MUSTCHECK;
 bool admin_pre_login(PgSocket *client, const char *username)  _MUSTCHECK;
 bool admin_post_login(PgSocket *client)  _MUSTCHECK;

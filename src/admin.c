@@ -148,7 +148,7 @@ static bool admin_flush_extended(PgSocket *admin, PktBuf *buf, const char *desc)
 
 bool admin_flush(PgSocket *admin, PktBuf *buf, const char *desc)
 {
-	if (admin->admin_extended_protocol_cmd)
+	if (admin->admin_ext_query_proto_state.state)
 		return admin_flush_extended(admin, buf, desc);
 
 	pktbuf_write_CommandComplete(buf, desc);
@@ -165,11 +165,21 @@ static bool admin_ready_extended(PgSocket *admin, const char *desc)
 	return pktbuf_send_immediate(&buf, admin);
 }
 
+static bool admin_nodata_extended(PgSocket *admin, const char *desc)
+{
+	PktBuf buf;
+	uint8_t tmp[512];
+	pktbuf_static(&buf, tmp, sizeof(tmp));
+	pktbuf_write_NoData(&buf);
+	return pktbuf_send_immediate(&buf, admin);
+}
+
 bool admin_ready(PgSocket *admin, const char *desc)
 {
 	PktBuf buf;
 	uint8_t tmp[512];
-	if (admin->admin_extended_protocol_cmd)
+	/* The extended query protocol expects different return packets */
+	if (admin->admin_ext_query_proto_state.query)
 		return admin_ready_extended(admin, desc);
 	
 	pktbuf_static(&buf, tmp, sizeof(tmp));
@@ -195,9 +205,20 @@ static bool admin_parse_complete(PgSocket *admin) {
 }
 
 void admin_free(PgSocket *admin) {
-	if (admin->admin_extended_protocol_cmd) 
-		free(admin->admin_extended_protocol_cmd);
+	if (admin->admin_ext_query_proto_state.query) 
+		free(admin->admin_ext_query_proto_state.query);
 }
+
+/*
+ * When client requests extended protocol to be used while
+ * connecting to the admin console, we should provide
+ * the row description packet only if client has sent the Desctibe packet.
+ * In case of simple protocol, we'll always provide the description row.
+ */
+bool admin_should_describe_rows(PgSocket *admin) {
+	return admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DISABLED
+		|| admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED;
+} 
 
 /*
  * some silly clients start actively messing with server parameters
@@ -234,7 +255,11 @@ static bool fake_show(PgSocket *admin, const char *name)
 	if (got) {
 		buf = pktbuf_dynamic(256);
 		if (buf) {
-			pktbuf_write_RowDescription(buf, "s", p->name);
+			if (admin_should_describe_rows(admin)) {
+				pktbuf_write_RowDescription(buf, "s", p->name);
+				if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+					return pktbuf_send_queued(buf, admin);
+			}
 			pktbuf_write_DataRow(buf, "s", p->value);
 			admin_flush(admin, buf, "SHOW");
 		} else {
@@ -536,11 +561,15 @@ static bool admin_show_databases(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "ssissiiiisiiii",
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "ssissiiiisiiii",
 				    "name", "host", "port",
 				    "database", "force_user", "pool_size", "min_pool_size", "reserve_pool",
 				    "server_lifetime", "pool_mode", "max_connections", "current_connections",
 				    "paused", "disabled");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
 	statlist_for_each(item, &database_list) {
 		db = container_of(item, PgDatabase, head);
 
@@ -582,8 +611,13 @@ static bool admin_show_peers(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "isii",
-				    "peer_id", "host", "port", "pool_size");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "isii",
+					"peer_id", "host", "port", "pool_size");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	statlist_for_each(item, &peer_list) {
 		peer = container_of(item, PgDatabase, head);
 
@@ -604,7 +638,13 @@ static bool admin_show_lists(PgSocket *admin, const char *arg)
 		admin_error(admin, "no mem");
 		return true;
 	}
-	pktbuf_write_RowDescription(buf, "si", "list", "items");
+
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "si", "list", "items");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+	
 #define SENDLIST(name, size) pktbuf_write_DataRow(buf, "si", (name), (size))
 	SENDLIST("databases", statlist_count(&database_list));
 	SENDLIST("users", statlist_count(&user_list));
@@ -643,9 +683,14 @@ static bool admin_show_users(PgSocket *admin, const char *arg)
 	}
 	cv.extra = pool_mode_map;
 
-	pktbuf_write_RowDescription(
-		buf, "sssiiii", "name", "pool_size", "pool_mode", "max_user_connections", "current_connections",
-		"max_user_client_connections", "current_client_connections");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(
+			buf, "sssiiii", "name", "pool_size", "pool_mode", "max_user_connections", "current_connections",
+			"max_user_client_connections", "current_client_connections");	
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+	
 	statlist_for_each(item, &user_list) {
 		PgGlobalUser *user = container_of(item, PgGlobalUser, head);
 		if (user->pool_size >= 0)
@@ -794,7 +839,11 @@ static bool admin_show_clients(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	socket_header(buf, false);
+	if (admin_should_describe_rows(admin)) {
+		socket_header(buf, false);
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
 	statlist_for_each(item, &pool_list) {
 		pool = container_of(item, PgPool, head);
 
@@ -828,7 +877,12 @@ static bool admin_show_servers(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	socket_header(buf, false);
+	if (admin_should_describe_rows(admin)) {
+		socket_header(buf, false);
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	statlist_for_each(item, &pool_list) {
 		pool = container_of(item, PgPool, head);
 		show_socket_list(buf, &pool->active_server_list, "active", false);
@@ -861,7 +915,12 @@ static bool admin_show_sockets(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	socket_header(buf, true);
+	if (admin_should_describe_rows(admin)) {
+		socket_header(buf, true);
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	statlist_for_each(item, &pool_list) {
 		pool = container_of(item, PgPool, head);
 		show_socket_list(buf, &pool->active_client_list, "cl_active", true);
@@ -901,7 +960,12 @@ static bool admin_show_active_sockets(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	socket_header(buf, true);
+	if (admin_should_describe_rows(admin)) {
+		socket_header(buf, true);
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);	
+	}
+
 	statlist_for_each(item, &pool_list) {
 		pool = container_of(item, PgPool, head);
 		show_active_socket_list(buf, &pool->active_client_list, "cl_active");
@@ -937,18 +1001,23 @@ static bool admin_show_pools(PgSocket *admin, const char *arg)
 		admin_error(admin, "no mem");
 		return true;
 	}
-	pktbuf_write_RowDescription(buf, "ssiiiiiiiiiiiiis",
-				    "database", "user",
-				    "cl_active", "cl_waiting",
-				    "cl_active_cancel_req",
-				    "cl_waiting_cancel_req",
-				    "sv_active",
-				    "sv_active_cancel",
-				    "sv_being_canceled",
-				    "sv_idle",
-				    "sv_used", "sv_tested",
-				    "sv_login", "maxwait",
-				    "maxwait_us", "pool_mode");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "ssiiiiiiiiiiiiis",
+						"database", "user",
+						"cl_active", "cl_waiting",
+						"cl_active_cancel_req",
+						"cl_waiting_cancel_req",
+						"sv_active",
+						"sv_active_cancel",
+						"sv_being_canceled",
+						"sv_idle",
+						"sv_used", "sv_tested",
+						"sv_login", "maxwait",
+						"maxwait_us", "pool_mode");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	statlist_for_each(item, &pool_list) {
 		pool = container_of(item, PgPool, head);
 		waiter = first_socket(&pool->waiting_client_list);
@@ -988,12 +1057,17 @@ static bool admin_show_peer_pools(PgSocket *admin, const char *arg)
 		admin_error(admin, "no mem");
 		return true;
 	}
-	pktbuf_write_RowDescription(buf, "iiiii",
-				    "peer_id",
-				    "cl_active_cancel_req",
-				    "cl_waiting_cancel_req",
-				    "sv_active_cancel",
-				    "sv_login");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "iiiii",
+					"peer_id",
+					"cl_active_cancel_req",
+					"cl_waiting_cancel_req",
+					"sv_active_cancel",
+					"sv_login");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	statlist_for_each(item, &peer_pool_list) {
 		pool = container_of(item, PgPool, head);
 		pktbuf_write_DataRow(buf, "iiiii",
@@ -1028,8 +1102,13 @@ static bool admin_show_mem(PgSocket *admin, const char *arg)
 		admin_error(admin, "no mem");
 		return true;
 	}
-	pktbuf_write_RowDescription(buf, "siiii", "name",
-				    "size", "used", "free", "memtotal");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "siiii", "name",
+						"size", "used", "free", "memtotal");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	slab_stats(slab_stat_cb, buf);
 	admin_flush(admin, buf, "SHOW");
 	return true;
@@ -1046,7 +1125,11 @@ static bool admin_show_state(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "ss", "key", "value");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "ss", "key", "value");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
 
 	pktbuf_write_DataRow(buf, "ss", "active", (cf_pause_mode == P_NONE) ? "yes" : "no");
 	pktbuf_write_DataRow(buf, "ss", "paused", (cf_pause_mode == P_PAUSE) ? "yes" : "no");
@@ -1093,7 +1176,12 @@ static bool admin_show_dns_hosts(PgSocket *admin, const char *arg)
 		admin_error(admin, "no mem");
 		return true;
 	}
-	pktbuf_write_RowDescription(buf, "sqs", "hostname", "ttl", "addrs");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "sqs", "hostname", "ttl", "addrs");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
+
 	adns_walk_names(adns, dns_name_cb, buf);
 	admin_flush(admin, buf, "SHOW");
 	return true;
@@ -1116,7 +1204,12 @@ static bool admin_show_dns_zones(PgSocket *admin, const char *arg)
 		admin_error(admin, "no mem");
 		return true;
 	}
-	pktbuf_write_RowDescription(buf, "sqi", "zonename", "serial", "count");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "sqi", "zonename", "serial", "count");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_immediate(buf, admin);	
+	}
+
 	adns_walk_zones(adns, dns_zone_cb, buf);
 	admin_flush(admin, buf, "SHOW");
 	return true;
@@ -1141,7 +1234,11 @@ static bool admin_show_config(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "ssss", "key", "value", "default", "changeable");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "ssss", "key", "value", "default", "changeable");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+	}
 
 	config_for_each(show_one_param, buf);
 
@@ -1153,6 +1250,10 @@ static bool admin_show_config(PgSocket *admin, const char *arg)
 /* Command: RELOAD */
 static bool admin_cmd_reload(PgSocket *admin, const char *arg)
 {
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED) {
+		return admin_nodata_extended(admin, "RELOAD");
+	}
+
 	if (arg && *arg)
 		return syntax_error(admin);
 
@@ -1170,6 +1271,10 @@ static bool admin_cmd_reload(PgSocket *admin, const char *arg)
 static bool admin_cmd_shutdown(PgSocket *admin, const char *arg)
 {
 	enum ShutDownMode mode = SHUTDOWN_IMMEDIATE;
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED) {
+		return admin_nodata_extended(admin, "SHUTDOWN");
+	}	
+
 	if (arg && *arg) {
 		if (strcasecmp(arg, "WAIT_FOR_CLIENTS") == 0)
 			mode = SHUTDOWN_WAIT_FOR_CLIENTS;
@@ -1219,6 +1324,9 @@ static void full_resume(void)
 /* Command: RESUME */
 static bool admin_cmd_resume(PgSocket *admin, const char *arg)
 {
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "RESUME");
+
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
 
@@ -1246,6 +1354,9 @@ static bool admin_cmd_resume(PgSocket *admin, const char *arg)
 /* Command: SUSPEND */
 static bool admin_cmd_suspend(PgSocket *admin, const char *arg)
 {
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "RELOAD");
+
 	if (arg && *arg)
 		return syntax_error(admin);
 
@@ -1272,6 +1383,9 @@ static bool admin_cmd_suspend(PgSocket *admin, const char *arg)
 /* Command: PAUSE */
 static bool admin_cmd_pause(PgSocket *admin, const char *arg)
 {
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "RELOAD");
+
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
 
@@ -1303,6 +1417,9 @@ static bool admin_cmd_pause(PgSocket *admin, const char *arg)
 /* Command: RECONNECT */
 static bool admin_cmd_reconnect(PgSocket *admin, const char *arg)
 {
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "RECONNECT");
+
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
 
@@ -1336,6 +1453,8 @@ static bool admin_cmd_reconnect(PgSocket *admin, const char *arg)
 static bool admin_cmd_disable(PgSocket *admin, const char *arg)
 {
 	PgDatabase *db;
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "DISABLE");
 
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
@@ -1358,6 +1477,8 @@ static bool admin_cmd_disable(PgSocket *admin, const char *arg)
 static bool admin_cmd_enable(PgSocket *admin, const char *arg)
 {
 	PgDatabase *db;
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "ENABLE");
 
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
@@ -1457,6 +1578,8 @@ static bool admin_cmd_kill(PgSocket *admin, const char *arg)
 	struct List *item, *tmp;
 	PgDatabase *db;
 	PgPool *pool;
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "KILL");
 
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
@@ -1487,6 +1610,9 @@ static bool admin_cmd_kill(PgSocket *admin, const char *arg)
 /* Command: WAIT_CLOSE */
 static bool admin_cmd_wait_close(PgSocket *admin, const char *arg)
 {
+	if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+		return admin_nodata_extended(admin, "WAIT_CLOSE");
+
 	if (!admin->admin_user)
 		return admin_error(admin, "admin access needed");
 
@@ -1608,7 +1734,12 @@ static bool admin_show_version(PgSocket *admin, const char *arg)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "s", "version");
+	if (admin_should_describe_rows(admin)) {
+		pktbuf_write_RowDescription(buf, "s", "version");
+		if (admin->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, admin);
+
+	}
 	pktbuf_write_DataRow(buf, "s", PACKAGE_STRING);
 
 	admin_flush(admin, buf, "SHOW");
@@ -1743,7 +1874,8 @@ failed:
  * we will invoke the `admin_parse_query` similar to how we perform the simple protocol
  * dance.
  */
-static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt) {
+static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt)
+{
 	PgBindPacket bp;
 	PgDescribePacket dp;
 	bool res;
@@ -1758,22 +1890,38 @@ static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt) {
 		 * The Parse packet contains the query, which is the only thing we care in
 		 * this protocol dance.
 		 */
-	  	admin->admin_extended_protocol_cmd = malloc(sizeof(PgParsePacket));
-		if (!admin->admin_extended_protocol_cmd) {
-			admin_error(admin, "failed to allocate parse packet");
+		if (admin->admin_ext_query_proto_state.query!= NULL) {
+			/* only one command is supported for extended protocol */
+			free(admin->admin_ext_query_proto_state.query);
+		}
+	  	admin->admin_ext_query_proto_state.query= malloc(sizeof(PgParsePacket));
+		if (!admin->admin_ext_query_proto_state.query) {
+			admin_error(admin, "failed to allocate parse packet for extended protocol");
 			disconnect_client(admin, true, "out of memory");
 			return false;
 		}
 
-	 	if (!unmarshall_parse_packet(admin, pkt, admin->admin_extended_protocol_cmd)) 
+	 	if (!unmarshall_parse_packet(admin, pkt, admin->admin_ext_query_proto_state.query)) 
 			return false;
+		if (admin->admin_ext_query_proto_state.query->name) {
+			admin_error(admin, "named parse are not supported for admin console");
+			disconnect_client(admin, true, "bad packet");
+			return false;
+		}
 		
+		admin->admin_ext_query_proto_state.state = ADMIN_EXT_QUERY_DESCRIBE_NEEDED;
 		skip_possibly_completely_buffered_packet(admin, pkt);
 		return admin_parse_complete(admin);
 	case 'B':
 		if (!unmarshall_bind_packet(admin, pkt, &bp))
 			return false;
-		Assert(admin->admin_extended_protocol_cmd);
+		if (bp.name) {
+			admin_error(admin, "named bind packets are not supported for admin console");
+			disconnect_client(admin, true, "bad packet");
+			return false;
+
+		}
+		Assert(admin->admin_ext_query_proto_state.query);
 
 		skip_possibly_completely_buffered_packet(admin, pkt);
 		return admin_bind_complete(admin);
@@ -1786,10 +1934,26 @@ static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt) {
 		 */
 		if (!unmarshall_describe_packet(admin, pkt, &dp))
 			return false;
+		if (dp.name) {
+			admin_error(admin, "named describe packets are not supported for admin console");
+			disconnect_client(admin, true, "bad packet");
+			return false;
+		}
 		skip_possibly_completely_buffered_packet(admin, pkt);
+
+		/*
+		 * 
+		 */
+		res = admin_parse_query(admin, admin->admin_ext_query_proto_state.query->query_and_parameters);
+		if (res)
+			sbuf_prepare_skip(&admin->sbuf, pkt->len);
+	 	
+		return res;
+
+		admin->admin_ext_query_proto_state.state = ADMIN_EXT_QUERY_DESCRIBE_COMPLETED; 
 		return true;
 	case 'E':
-		res = admin_parse_query(admin, admin->admin_extended_protocol_cmd->query_and_parameters);
+		res = admin_parse_query(admin, admin->admin_ext_query_proto_state.query->query_and_parameters);
 		if (res)
 			sbuf_prepare_skip(&admin->sbuf, pkt->len);
 	 	
@@ -1820,6 +1984,13 @@ bool admin_handle_client(PgSocket *admin, PktHdr *pkt)
 			return false;
 		}
 		log_debug("got admin query: %s", q);
+		if (admin->admin_ext_query_proto_state.query == NULL) {
+			/* 
+			 * client has switched to simple protocol,
+			 * free the extended protocol artifact.
+			 */
+			free(admin->admin_ext_query_proto_state.query);
+		}
 		res = admin_parse_query(admin, q);
 		if (res)
 			sbuf_prepare_skip(&admin->sbuf, pkt->len);

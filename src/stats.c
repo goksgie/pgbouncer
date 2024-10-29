@@ -132,17 +132,21 @@ bool admin_database_stats(PgSocket *client, struct StatList *pool_list)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "sNNNNNNNNNNNNNNNN", "database",
-				    "total_server_assignment_count",
-				    "total_xact_count", "total_query_count",
-				    "total_received", "total_sent",
-				    "total_xact_time", "total_query_time",
-				    "total_wait_time",
-				    "avg_server_assignment_count",
-				    "avg_xact_count", "avg_query_count",
-				    "avg_recv", "avg_sent",
-				    "avg_xact_time", "avg_query_time",
-				    "avg_wait_time");
+	if (admin_should_describe_rows(client)) {
+		pktbuf_write_RowDescription(buf, "sNNNNNNNNNNNNNNNN", "database",
+						"total_server_assignment_count",
+						"total_xact_count", "total_query_count",
+						"total_received", "total_sent",
+						"total_xact_time", "total_query_time",
+						"total_wait_time",
+						"avg_server_assignment_count",
+						"avg_xact_count", "avg_query_count",
+						"avg_recv", "avg_sent",
+						"avg_xact_time", "avg_query_time",
+						"avg_wait_time");
+		if (client->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, client);
+	}
 	statlist_for_each(item, pool_list) {
 		pool = container_of(item, PgPool, head);
 
@@ -197,12 +201,17 @@ bool admin_database_stats_totals(PgSocket *client, struct StatList *pool_list)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "sNNNNNNNN", "database",
-				    "server_assignment_count",
-				    "xact_count", "query_count",
-				    "bytes_received", "bytes_sent",
-				    "xact_time", "query_time",
-				    "wait_time");
+	if (admin_should_describe_rows(client)) {
+		pktbuf_write_RowDescription(buf, "sNNNNNNNN", "database",
+						"server_assignment_count",
+						"xact_count", "query_count",
+						"bytes_received", "bytes_sent",
+						"xact_time", "query_time",
+						"wait_time");
+		if (client->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, client);
+	}
+
 	statlist_for_each(item, pool_list) {
 		pool = container_of(item, PgPool, head);
 
@@ -257,12 +266,17 @@ bool admin_database_stats_averages(PgSocket *client, struct StatList *pool_list)
 		return true;
 	}
 
-	pktbuf_write_RowDescription(buf, "sNNNNNNNN", "database",
-				    "server_assignment_count",
-				    "xact_count", "query_count",
-				    "bytes_received", "bytes_sent",
-				    "xact_time", "query_time",
-				    "wait_time");
+	if (admin_should_describe_rows(client)) {
+		pktbuf_write_RowDescription(buf, "sNNNNNNNN", "database",
+						"server_assignment_count",
+						"xact_count", "query_count",
+						"bytes_received", "bytes_sent",
+						"xact_time", "query_time",
+						"wait_time");
+	if (client->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, client);	
+	}
+
 	statlist_for_each(item, pool_list) {
 		pool = container_of(item, PgPool, head);
 
@@ -313,7 +327,11 @@ bool show_stat_totals(PgSocket *client, struct StatList *pool_list)
 
 	calc_average(&avg, &st_total, &old_total);
 
-	pktbuf_write_RowDescription(buf, "sN", "name", "value");
+	if (admin_should_describe_rows(client)) {
+		pktbuf_write_RowDescription(buf, "sN", "name", "value");
+		if (client->admin_ext_query_proto_state.state == ADMIN_EXT_QUERY_DESCRIBE_NEEDED)
+			return pktbuf_send_queued(buf, client);
+	}
 
 #define WTOTAL(name) pktbuf_write_DataRow(buf, "sN", "total_" #name, st_total.name)
 #define WAVG(name) pktbuf_write_DataRow(buf, "sN", "avg_" #name, avg.name)

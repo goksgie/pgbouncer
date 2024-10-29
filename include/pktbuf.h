@@ -128,6 +128,9 @@ void pktbuf_write_ExtQuery(PktBuf *buf, const char *query, int nargs, ...);
 #define pktbuf_write_BindComplete(buf) \
 	pktbuf_write_generic(buf, '2', "")
 
+#define pktbuf_write_NoData(buf) \
+	pktbuf_write_generic(buf, 'n', "")
+
 #define pktbuf_write_DescribeStmt(buf, stmt) \
 	pktbuf_write_generic(buf, 'D', "cs", 'S', stmt)
 

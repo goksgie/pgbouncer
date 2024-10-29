@@ -158,6 +158,7 @@ typedef struct ScramState ScramState;
 typedef struct PgPreparedStatement PgPreparedStatement;
 typedef enum ResponseAction ResponseAction;
 typedef enum ReplicationType ReplicationType;
+typedef enum AdminExtendedQuertyState AdminExtendedQuertyState;
 
 extern int cf_sbuf_len;
 
@@ -741,8 +742,15 @@ struct PgSocket {
 	 * when admin console supports extended queries, the parse packet's
 	 * contents will be stored here. When Execute packet is observed,
 	 * we will execute the command stored here.
+	 * Depending on the query's state, we will populate the desciption
+	 * headers or not.
 	 */
-	PgParsePacket *admin_extended_protocol_cmd;
+	struct AdminExtendedQueryProtocolState {
+		
+		PgParsePacket *query;
+		AdminExtendedQuertyState state : 8;
+		
+	} admin_ext_query_proto_state;
 
 	SBuf sbuf;		/* stream buffer, must be last */
 };
