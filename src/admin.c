@@ -1903,7 +1903,8 @@ static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt)
 
 	 	if (!unmarshall_parse_packet(admin, pkt, admin->admin_ext_query_proto_state.query)) 
 			return false;
-		if (admin->admin_ext_query_proto_state.query->name) {
+		if (admin->admin_ext_query_proto_state.query->name && strncmp(admin->admin_ext_query_proto_state.query->name, "", 1)) {
+			log_info("Query's name: {%s}", admin->admin_ext_query_proto_state.query->name);
 			admin_error(admin, "named parse are not supported for admin console");
 			disconnect_client(admin, true, "bad packet");
 			return false;
@@ -1915,7 +1916,7 @@ static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt)
 	case 'B':
 		if (!unmarshall_bind_packet(admin, pkt, &bp))
 			return false;
-		if (bp.name) {
+		if (bp.name && strncmp(bp.name, "", 1)) {
 			admin_error(admin, "named bind packets are not supported for admin console");
 			disconnect_client(admin, true, "bad packet");
 			return false;
@@ -1934,7 +1935,7 @@ static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt)
 		 */
 		if (!unmarshall_describe_packet(admin, pkt, &dp))
 			return false;
-		if (dp.name) {
+		if (dp.name && strncmp(dp.name, "", 1)) {
 			admin_error(admin, "named describe packets are not supported for admin console");
 			disconnect_client(admin, true, "bad packet");
 			return false;
@@ -1942,16 +1943,16 @@ static bool admin_handle_extended_protocol(PgSocket *admin, PktHdr *pkt)
 		skip_possibly_completely_buffered_packet(admin, pkt);
 
 		/*
-		 * 
+		 * We're making use of the same infrastructure as the execution path, but managing
+		 * whether we need the describe packet or not through extended query protocol state.
 		 */
 		res = admin_parse_query(admin, admin->admin_ext_query_proto_state.query->query_and_parameters);
-		if (res)
-			sbuf_prepare_skip(&admin->sbuf, pkt->len);
-	 	
-		return res;
+		if (!res)
+		 	return false;
 
 		admin->admin_ext_query_proto_state.state = ADMIN_EXT_QUERY_DESCRIBE_COMPLETED; 
-		return true;
+		sbuf_prepare_skip(&admin->sbuf, pkt->len);
+		return res;
 	case 'E':
 		res = admin_parse_query(admin, admin->admin_ext_query_proto_state.query->query_and_parameters);
 		if (res)
